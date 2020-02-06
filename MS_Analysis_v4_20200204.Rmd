@@ -1,0 +1,830 @@
+---
+title: "MS_Analysis_v4_20191128"
+subtitle: "Classification of Impaired VS. Preserved Patient (n=183)"
+author: "Dana Zeng"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    code_folding: hide
+---
+### Load the imputed dataset and subset for each model
+* Model 1: Demographics ONLY (183*10)
+* Model 2: Volumetric metrics ONLY (183*190)
+* Model 3: Lesion (whole, no left & right )ONLY (T2) (183*43)
+* Model 4: DTI ONLY (183*39)
+* Model 5: Resting state ONLY (182*1514)
+* Model 6: All top variables by RF
+
+
+```{r setup, include=FALSE, warning=F}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 10, fig.height = 7)
+library(tidyverse)
+library(mice)
+library(glmnet)
+library(caret)
+library(pROC)
+library(randomForest)
+library(broom)
+library(knitr)
+library(ggpubr)
+library(Boruta)
+library(ggthemes)
+load("./MS_Datacreation_v2_imp.RData")
+df <- df_imputed 
+df_no128 <- df_imputed_no128 
+rm(df_imputed, df_imputed_no128)
+df_m1 <- df[,c(2:10,282)]
+df_m2 <- df[,c(11:199,282)]
+df_m3 <- df[,c(200:213,282)]
+df_m4 <- df[,c(242:279,282)]
+df_m5 <- df_no128[,c(283:1795,282)] 
+
+iteration_control <- 101
+
+cut_name <- function(x){
+  for (i in 1:length(x)){
+  if (nchar(x[i])<=50){
+  x[i] = paste0(substr(x[i],1,str_locate_all(x[i],"_")[[1]][3,1]),
+                "\n",
+                substr(x[i],str_locate_all(x[i],"_")[[1]][3,1]+1,str_locate_all(x[i],"_")[[1]][6,1]),
+                "\n",
+                substr(x[i],str_locate_all(x[i],"_")[[1]][6,1]+1,nchar(x[i])))}
+  else if (nchar(x[i])>50 ){
+      x[i] = paste0(substr(x[i],1,str_locate_all(x[i],"_")[[1]][3,1]),
+                "\n",
+                substr(x[i],str_locate_all(x[i],"_")[[1]][3,1]+1,str_locate_all(x[i],"_")[[1]][6,1]),
+                "\n",
+                substr(x[i],str_locate_all(x[i],"_")[[1]][6,1]+1,str_locate_all(x[i],"_")[[1]][9,1]),
+                "\n",
+                substr(x[i],str_locate_all(x[i],"_")[[1]][9,1]+1,nchar(x[i])))}
+  }  
+  return(x)    
+  }
+```   
+
+
+## Model 1 Demographics Only 
+### Logistic Regression by each variable alone
+```{r}
+df_m1[,c(1,4:7,9)] <- scale(df_m1[,c(1,4:7,9)], scale = TRUE, center = TRUE)
+df_m1$edss <- as.numeric(df_m1$edss)
+
+nuemric <- tibble(
+  var = names(df_m1)[c(1,4:9)],
+  test = apply(df_m1[,c(1,4:9)], 2, function(x){
+    return(tidy(glm(category~x, data = df_m1, family = "binomial")))
+  })) 
+categorical <- tibble(
+  var = names(df_m1)[c(2,3)],
+  test = apply(df_m1[,c(2,3)], 2, function(x){
+    return(tidy(glm(category~x, data = df_m1, family = "binomial")))
+  })) 
+all <- rbind(nuemric, categorical) %>% unnest() %>% filter(term!="(Intercept)")
+kable(all %>% mutate(var = ifelse(duplicated(var), "", as.character(var))))
+```
+
+## Fit Random Forest to Different Models
+### Model 1: Demograhpic Variables
+```{r}
+auc_rf <- data_frame(iteration = NA, auc = NA,ci_low = NA,ci_high = NA)
+roc_list_rf <- list()
+mtry <-  data_frame(iteration=NA, mtry = NA)
+df_m1$category <- factor(df_m1$category)
+levels(df_m1$category) <- make.names(levels(df_m1$category))
+
+set.seed(9999)
+  for (i in 1:iteration_control){
+      train_idx <- createDataPartition(df_m1$category, p = .8, list = FALSE, times = 1)
+      train <- df_m1[train_idx,]
+      test  <- df_m1[-train_idx,]
+
+      result <- train(
+        as.factor(category) ~ ., data = train,
+        method = "rf",
+        trControl = trainControl("cv", number = 5, savePredictions = TRUE, classProbs = TRUE),
+        importance=T,
+        ntree=500
+      )
+      ## Make Predictions
+      pred <- predict(result, test, type = "prob")
+
+      # Calculate ROC AND AUC
+      roc <- roc(test$category, pred[,2], quiet = T)
+      auc_result <- c(iteration = i, auc = ci(roc)[2], ci_low = ci(roc)[1], ci_high = ci(roc)[3])
+      auc_rf <- rbind(auc_rf, auc_result)
+      model_mtry <- c(iteration = i, mtry=result$bestTune[1,1])
+      
+      #Save mtry
+      mtry <- rbind(mtry,model_mtry)
+
+      # Save ROC Obeject for plot
+      roc_list_rf[[i]] <- roc
+
+  }
+auc_rf <- auc_rf[-1,]
+mtry <- mtry[-1,]
+
+set.seed(9999)
+boruta.train <- Boruta(as.factor(category) ~ ., data =df_m1,ntree=500,maxRuns= 2000)
+print(boruta.train)
+final.boruta <- TentativeRoughFix(boruta.train)
+
+
+# Save plotting and table objects
+auc_m1 <- mutate(auc_rf, model = "Demographic")
+median_rf_m1 <- roc_list_rf[[which(auc_rf$auc==median(auc_rf$auc))[1]]]
+boruta_m1 <- final.boruta
+mtry_m1 <- mtry
+
+```
+
+### Model 2: Volumetric metrics ONLY (T1)
+```{r, message="hide", result = "hide"}
+
+auc_rf <- data_frame(iteration = NA, auc = NA,ci_low = NA,ci_high = NA)
+var_imp_rf <- data.frame(variable = names(df_m2)[-190])
+mtry <-  data_frame(iteration=NA, mtry = NA)
+roc_list_rf <- list()
+
+df_m2$category <- factor(df_m2$category)
+levels(df_m2$category) <- make.names(levels(df_m2$category))
+
+set.seed(9999)
+  for (i in 1:iteration_control){
+      train_idx <- createDataPartition(df_m2$category, p = .8, list = FALSE, times = 1)
+      train <- df_m2[train_idx,]
+      test  <- df_m2[-train_idx,]
+
+      result <- train(
+        as.factor(category) ~ ., data = train,
+        method = "rf",
+        trControl = trainControl("cv", number = 5, savePredictions = TRUE, classProbs = TRUE),
+        importance=T,
+        ntree=500
+      )
+      ## Make Predictions
+      pred <- predict(result, test, type = "prob")
+
+      # Calculate ROC AND AUC
+      roc <- roc(test$category, pred[,2], quiet = T)
+      auc_result <- c(iteration = i, auc = ci(roc)[2], ci_low = ci(roc)[1], ci_high = ci(roc)[3])
+      auc_rf <- rbind(auc_rf, auc_result)
+      model_mtry <- c(iteration = i, mtry=result$bestTune[1,1])
+      
+      #Save mtry
+      mtry <- rbind(mtry,model_mtry)
+
+
+
+      # Save ROC Obeject for plot
+      roc_list_rf[[i]] <- roc
+
+      # Save Var_important
+      var_imp <- select(as_tibble (randomForest::importance(result$finalModel)),MeanDecreaseAccuracy)
+      colnames(var_imp) <- paste0("iteration_",i)
+      var_imp_rf <- cbind(var_imp_rf,var_imp)
+  }
+auc_rf <- auc_rf[-1,]
+mtry <- mtry[-1,]
+
+set.seed(9999)
+boruta.train <- Boruta(as.factor(category) ~ ., data =df_m2,ntree=500,maxRuns= 2000)
+print(boruta.train)
+final.boruta <- TentativeRoughFix(boruta.train)
+
+
+# Save plotting and table objects
+auc_m2 <- mutate(auc_rf, model = "T1")
+median_rf_m2 <- roc_list_rf[[which(auc_rf$auc==median(auc_rf$auc))[1]]]
+boruta_m2 <- final.boruta
+var_imp_m2 <- attStats(final.boruta) %>%
+  tibble::rownames_to_column( "variable") %>%
+  filter(decision == "Confirmed") %>%
+  mutate(variable = fct_reorder(variable, meanImp))
+mtry_m2 <- mtry
+
+```
+
+### Model 3: Lesion (whole, no left & right) ONLY (T2) (183*43)
+```{r, message="hide", result = "hide"}
+
+auc_rf <- data_frame(iteration = NA, auc = NA,ci_low = NA,ci_high = NA)
+var_imp_rf <- data.frame(variable = names(df_m3)[-15])
+mtry <-  data_frame(iteration=NA, mtry = NA)
+roc_list_rf <- list()
+
+df_m3$category <- factor(df_m3$category)
+levels(df_m3$category) <- make.names(levels(df_m3$category))
+set.seed(9999)
+
+  for (i in 1:iteration_control){
+      train_idx <- createDataPartition(df_m3$category, p = .8, list = FALSE, times = 1)
+      train <- df_m3[train_idx,]
+      test  <- df_m3[-train_idx,]
+
+      result <- train(
+        as.factor(category) ~ ., data = train,
+        method = "rf",
+        trControl = trainControl("cv", number = 5, savePredictions = TRUE, classProbs = TRUE),
+        importance=T,
+        ntree=500
+      )
+      ## Make Predictions
+      pred <- predict(result, test, type = "prob")
+
+      # Calculate ROC AND AUC
+      roc <- roc(test$category, pred[,2], quiet = T)
+      auc_result <- c(iteration = i, auc = ci(roc)[2], ci_low = ci(roc)[1], ci_high = ci(roc)[3])
+      auc_rf <- rbind(auc_rf, auc_result)
+      model_mtry <- c(iteration = i, mtry=result$bestTune[1,1])
+      
+      #Save mtry
+      mtry <- rbind(mtry,model_mtry)
+
+
+
+      # Save ROC Obeject for plot
+      roc_list_rf[[i]] <- roc
+
+      # Save Var_important
+      var_imp <- select(as_tibble (randomForest::importance(result$finalModel)),MeanDecreaseAccuracy)
+      colnames(var_imp) <- paste0("iteration_",i)
+      var_imp_rf <- cbind(var_imp_rf,var_imp)
+  }
+auc_rf <- auc_rf[-1,]
+mtry <- mtry[-1,]
+
+set.seed(9999)
+boruta.train <- Boruta(as.factor(category) ~ ., data = df_m3,ntree=500,maxRuns= 1500)
+print(boruta.train)
+final.boruta <- TentativeRoughFix(boruta.train)
+
+
+# Save plotting and table objects
+auc_m3 <- mutate(auc_rf, model = "T2")
+median_rf_m3 <- roc_list_rf[[which(auc_rf$auc==median(auc_rf$auc))[1]]]
+boruta_m3 <- final.boruta
+var_imp_m3 <- attStats(final.boruta) %>%
+  tibble::rownames_to_column( "variable") %>%
+  filter(decision == "Confirmed") %>%
+  mutate(variable = fct_reorder(variable, meanImp))
+mtry_m3 <- mtry
+
+```
+
+### Model 4: DTI ONLY (183*39)
+```{r, message="hide", result = "hide"}
+
+auc_rf <- data_frame(iteration = NA, auc = NA,ci_low = NA,ci_high = NA)
+var_imp_rf <- data.frame(variable = names(df_m4)[-39])
+mtry <-  data_frame(iteration=NA, mtry = NA)
+roc_list_rf <- list()
+
+df_m4$category <- factor(df_m4$category)
+levels(df_m4$category) <- make.names(levels(df_m4$category))
+
+set.seed(9999)
+  for (i in 1:iteration_control){
+      train_idx <- createDataPartition(df_m4$category, p = .8, list = FALSE, times = 1)
+      train <- df_m4[train_idx,]
+      test  <- df_m4[-train_idx,]
+
+      result <- train(
+        as.factor(category) ~ ., data = train,
+        method = "rf",
+        trControl = trainControl("cv", number = 5, savePredictions = TRUE, classProbs = TRUE),
+        importance=T,
+        ntree=500
+      )
+      ## Make Predictions
+      pred <- predict(result, test, type = "prob")
+
+      # Calculate ROC AND AUC
+      roc <- roc(test$category, pred[,2], quiet = T)
+      auc_result <- c(iteration = i, auc = ci(roc)[2], ci_low = ci(roc)[1], ci_high = ci(roc)[3])
+      auc_rf <- rbind(auc_rf, auc_result)
+      model_mtry <- c(iteration = i, mtry=result$bestTune[1,1])
+      
+      #Save mtry
+      mtry <- rbind(mtry,model_mtry)
+
+
+
+      # Save ROC Obeject for plot
+      roc_list_rf[[i]] <- roc
+
+      # Save Var_important
+      var_imp <- select(as_tibble (randomForest::importance(result$finalModel)),MeanDecreaseAccuracy)
+      colnames(var_imp) <- paste0("iteration_",i)
+      var_imp_rf <- cbind(var_imp_rf,var_imp)
+  }
+auc_rf <- auc_rf[-1,]
+mtry <- mtry[-1,]
+
+set.seed(9999)
+boruta.train <- Boruta(as.factor(category) ~ ., data = df_m4,ntree=500,maxRuns= 1000)
+print(boruta.train)
+final.boruta <- TentativeRoughFix(boruta.train)
+
+
+# Save plotting and table objects
+auc_m4 <- mutate(auc_rf, model = "DTI")
+median_rf_m4 <- roc_list_rf[[which(auc_rf$auc==median(auc_rf$auc))[1]]]
+boruta_m4 <- final.boruta
+var_imp_m4 <- attStats(final.boruta) %>%
+  tibble::rownames_to_column( "variable") %>%
+  filter(decision == "Confirmed") %>%
+  mutate(variable = fct_reorder(variable, meanImp))
+mtry_m4 <- mtry
+
+```
+
+###  Model 5: Resting State Only 182*1514
+```{r, message="hide", result = "hide"}
+
+auc_rf <- data_frame(iteration = NA, auc = NA,ci_low = NA,ci_high = NA)
+var_imp_rf <- data.frame(variable = names(df_m5)[-1514])
+mtry <-  data_frame(iteration=NA, mtry = NA)
+roc_list_rf <- list()
+
+df_m5$category <- factor(df_m5$category)
+levels(df_m5$category) <- make.names(levels(df_m5$category))
+
+set.seed(9999)
+  for (i in 1:iteration_control){
+      train_idx <- createDataPartition(df_m5$category, p = .8, list = FALSE, times = 1)
+      train <- df_m5[train_idx,]
+      test  <- df_m5[-train_idx,]
+
+      result <- train(
+        as.factor(category) ~ ., data = train,
+        method = "rf",
+        trControl = trainControl("cv", number = 5, savePredictions = TRUE, classProbs = TRUE),
+        importance=T,
+        ntree=500
+      )
+      ## Make Predictions
+      pred <- predict(result, test, type = "prob")
+
+      # Calculate ROC AND AUC
+      roc <- roc(test$category, pred[,2], quiet = T)
+      auc_result <- c(iteration = i, auc = ci(roc)[2], ci_low = ci(roc)[1], ci_high = ci(roc)[3])
+      auc_rf <- rbind(auc_rf, auc_result)
+      model_mtry <- c(iteration = i, mtry=result$bestTune[1,1])
+      
+      #Save mtry
+      mtry <- rbind(mtry,model_mtry)
+
+
+      # Save ROC Obeject for plot
+      roc_list_rf[[i]] <- roc
+
+      # Save Var_important
+      var_imp <- select(as_tibble (randomForest::importance(result$finalModel)),MeanDecreaseAccuracy)
+      colnames(var_imp) <- paste0("iteration_",i)
+      var_imp_rf <- cbind(var_imp_rf,var_imp)
+  }
+auc_rf <- auc_rf[-1,]
+mtry <- mtry[-1,]
+
+
+set.seed(9999)
+boruta.train <- Boruta(as.factor(category) ~ ., data = df_m5,ntree=500,maxRuns= 3000)
+print(boruta.train)
+final.boruta <- TentativeRoughFix(boruta.train)
+
+# Save plotting and table objects
+auc_m5 <- mutate(auc_rf, model = "RS")
+median_rf_m5 <- roc_list_rf[[which(auc_rf$auc==median(auc_rf$auc))[1]]]
+boruta_m5 <- final.boruta
+var_imp_m5 <- attStats(final.boruta) %>%
+  tibble::rownames_to_column( "variable") %>%
+  filter(decision == "Confirmed") %>%
+  mutate(variable = fct_reorder(variable, meanImp))
+mtry_m5 <- mtry
+
+```
+
+
+### All Important Variables Model 183*60
+```{r}
+df_m6 <- df_no128 %>% select(pull(var_imp_m2,variable) %>% as.character(),
+                    pull(var_imp_m3,variable) %>% as.character(),
+                    pull(var_imp_m4,variable) %>% as.character(),
+                    pull(var_imp_m5,variable) %>% as.character() ,
+                    category)
+
+auc_rf <- data_frame(iteration = NA, auc = NA,ci_low = NA,ci_high = NA)
+var_imp_rf <- data.frame(variable = head(names(df_m6),-1))
+mtry <-  data_frame(iteration=NA, mtry = NA)
+roc_list_rf <- list()
+
+df_m6$category <- factor(df_m6$category)
+levels(df_m6$category) <- make.names(levels(df_m5$category))
+
+set.seed(9999)
+  for (i in 1:iteration_control){
+      train_idx <- createDataPartition(df_m6$category, p = .8, list = FALSE, times = 1)
+      train <- df_m6[train_idx,]
+      test  <- df_m6[-train_idx,]
+
+      result <- train(
+        as.factor(category) ~ ., data = train,
+        method = "rf",
+        trControl = trainControl("cv", number = 5, savePredictions = TRUE, classProbs = TRUE),
+        importance=T,
+        ntree=500
+      )
+      ## Make Predictions
+      pred <- predict(result, test, type = "prob")
+
+      # Calculate ROC AND AUC
+      roc <- roc(test$category, pred[,2], quiet = T)
+      auc_result <- c(iteration = i, auc = ci(roc)[2], ci_low = ci(roc)[1], ci_high = ci(roc)[3])
+      auc_rf <- rbind(auc_rf, auc_result)
+      model_mtry <- c(iteration = i, mtry=result$bestTune[1,1])
+      
+      #Save mtry
+      mtry <- rbind(mtry,model_mtry)
+
+
+
+      # Save ROC Obeject for plot
+      roc_list_rf[[i]] <- roc
+
+      # Save Var_important
+      var_imp <- select(as_tibble (randomForest::importance(result$finalModel)),MeanDecreaseAccuracy)
+      colnames(var_imp) <- paste0("iteration_",i)
+      var_imp_rf <- cbind(var_imp_rf,var_imp)
+  }
+auc_rf <- auc_rf[-1,]
+mtry <- mtry[-1,]
+
+
+set.seed(9999)
+boruta.train <- Boruta(as.factor(category) ~ ., data = df_m6,ntree=500,maxRuns= 2500)
+print(boruta.train)
+final.boruta <- TentativeRoughFix(boruta.train)
+
+# Save plotting and table objects
+auc_m6 <- mutate(auc_rf, model = "All_Important")
+median_rf_m6 <- roc_list_rf[[which(auc_rf$auc==median(auc_rf$auc))[1]]]
+boruta_m6 <- final.boruta
+var_imp_m6 <- attStats(final.boruta) %>%
+  tibble::rownames_to_column( "variable") %>%
+  filter(decision == "Confirmed") %>%
+  mutate(variable = fct_reorder(variable, meanImp))
+
+mtry_m6 <- mtry
+
+```
+
+
+
+## Results
+
+### Plotting the Distribution of AUCs for all models
+```{r}
+rbind(auc_m1, auc_m2, auc_m3,auc_m4,auc_m5,auc_m6) %>%
+  mutate(model = as.factor(model),
+         model = fct_relevel(model, "Demographic","T1", "T2", "DTI", "RS","All_Important")) %>%
+  ggplot(aes(x= model, y = auc, color = model))+
+  geom_boxplot()+
+  theme_bw()
+```
+
+### Plotting the EN VS. RF model with the median ROC
+```{r}
+par(pty = "s")
+plot.roc(median_rf_m2, print.auc = T, col = 4 ,print.auc.y = .4)
+plot.roc(median_rf_m3, print.auc = T, col = 3 ,print.auc.y = .35,add=T)
+plot.roc(median_rf_m4, print.auc = T, col = 2 ,print.auc.y = .3,add=T)
+plot.roc(median_rf_m5, print.auc = T, col = 1 ,print.auc.y = .25,add=T)
+plot.roc(median_rf_m6, print.auc = T, col = 6 ,print.auc.y = .20,add=T)
+legend("bottomright", legend = c("T1", "T2","DTI","RS","All_Important"), col = c(4,3,2,1,6), lwd = 4, cex=.5)
+
+```
+
+
+### Median ROC with CI
+```{r}
+auc_sum <- rbind(auc_m1,auc_m2, auc_m3,auc_m4,auc_m5,auc_m6)%>%
+  select(auc,model) %>%
+  group_by(model) %>%
+  summarise(mean = mean(auc),
+            sd = sd(auc),
+            median = median(auc),
+            ci_low = quantile(auc,0.025),
+            ci_high  = quantile(auc,0.975)) %>%
+  arrange(factor(model, levels = c("Demographic","T1", "T2", "DTI", "RS","All_Important")))
+write.csv(auc_sum, "model_auc_summary_w_m1.csv")
+kable(auc_sum)
+```
+
+
+
+### T1 Model
+
+#### Important Variables
+```{r}
+confirm <- var_imp_m2 %>% pull(variable) %>% as.character()
+top_var_m2 <- as_data_frame(boruta_m2$ImpHistory) %>%
+  select(-c(shadowMax,shadowMean,shadowMin)) %>%
+  select(confirm) %>%
+  gather(everything(), key = variable, value = importance) %>%
+  group_by(variable) %>%
+  summarise(mean = mean(importance),
+            sd = sd(importance),
+            ci_low = quantile(importance,.025),
+            ci_high = quantile(importance,.975)) %>%
+  mutate(variable = fct_reorder(variable, mean)) %>%
+  arrange(desc(mean))
+#Plot top varss
+  ggplot(top_var_m2,aes(x =variable, y=mean,fill = mean))+
+  geom_bar(position="dodge",stat="identity")+
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), alpha=.7)+
+  coord_flip()+
+  ggtitle("T1 Model: Important Variables identified by Boruta")+
+ theme_bw()
+```
+
+#### Top 5 Important Variables plot
+```{r}
+name <- top_var_m2 %>%
+  arrange(desc(mean)) %>%
+  head(5) %>%
+  pull(variable) %>%
+  as.character()
+df_m2 %>%
+  select(name,category) %>%
+  mutate(category = recode(category, "X0" = "CP", "X1" = "CI")) %>%
+  gather(1:5, key= variable, value = value) %>%
+  mutate(variable = as.factor(variable),
+         variable = fct_relevel(variable,name)) %>%
+  group_by(variable,category) %>%
+  mutate(median = median(value),
+         sd=sd(value),
+         ci_low = quantile(value,.025),
+        ci_high = quantile(value,.975)) %>%
+  ggplot(aes(x = category,y = value,color=category))+
+  geom_jitter()+
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),color = "black")+
+  facet_wrap(.~variable,scales = "free",nrow = 1)+
+ theme_bw()
+```
+
+
+
+### T2 Model
+#### Important Variables
+```{r}
+confirm <- var_imp_m3 %>% pull(variable) %>% as.character()
+top_var_m3 <- as_data_frame(boruta_m3$ImpHistory) %>%
+  select(-c(shadowMax,shadowMean,shadowMin)) %>%
+  select(confirm) %>%
+  gather(everything(), key = variable, value = importance) %>%
+  group_by(variable) %>%
+  summarise(mean = mean(importance),
+            sd = sd(importance),
+            ci_low = quantile(importance,.025),
+            ci_high = quantile(importance,.975)) %>%
+  mutate(variable = fct_reorder(variable, mean)) %>%
+  arrange(desc(mean))
+#Plot top vars
+  ggplot(top_var_m3,aes(x =variable, y=mean,fill = mean))+
+  geom_bar(position="dodge",stat="identity")+
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),alpha=.7)+
+  coord_flip()+
+  ggtitle("T2 Model: Important Variables identified by Boruta")+
+ theme_bw()
+
+```
+
+#### Top 5 Important Variables plot
+```{r}
+name <- top_var_m3 %>%
+  arrange(desc(mean)) %>%
+  head(5) %>%
+  pull(variable) %>%
+  as.character()
+df_m3 %>%
+  select(name,category) %>%
+  mutate(category = recode(category, "X0" = "CP", "X1" = "CI")) %>%
+  gather(1:5, key= variable, value = value) %>%
+  mutate(variable = as.factor(variable),
+         variable = fct_relevel(variable,name)) %>%
+  group_by(variable,category) %>%
+  mutate(median = median(value),
+         sd=sd(value),
+         ci_low = quantile(value,.025),
+        ci_high = quantile(value,.975)) %>%
+  ggplot(aes(x = category,y = value,color=category))+
+  geom_jitter()+
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),color = "black")+
+  facet_wrap(.~variable,scales = "free",nrow = 1)+
+ theme_bw()
+```
+
+
+### DTI Model
+#### Important Variables
+```{r}
+confirm <- var_imp_m4 %>% pull(variable) %>% as.character()
+top_var_m4 <- as_data_frame(boruta_m4$ImpHistory) %>%
+  select(-c(shadowMax,shadowMean,shadowMin)) %>%
+  select(confirm) %>%
+  gather(everything(), key = variable, value = importance) %>%
+  group_by(variable) %>%
+  summarise(mean = mean(importance),
+            sd = sd(importance),
+            ci_low = quantile(importance,.025),
+            ci_high = quantile(importance,.975)) %>%
+  mutate(variable = fct_reorder(variable, mean)) %>%
+  arrange(desc(mean))
+#Plot top vars
+  ggplot(top_var_m4,aes(x =variable, y=mean,fill = mean))+
+  geom_bar(position="dodge",stat="identity")+
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), alpha=.7)+
+  coord_flip()+
+  ggtitle("DTI Model: Important Variables identified by Boruta")+
+ theme_bw()
+```
+
+#### Top 5 Important Variables plot
+```{r}
+name <- top_var_m4 %>%
+  arrange(desc(mean)) %>%
+  head(5) %>%
+  pull(variable) %>%
+  as.character()
+
+df_m4 %>%
+  select(name,category) %>%
+  mutate(category = recode(category, "X0" = "CP", "X1" = "CI")) %>%
+  gather(1:5, key= variable, value = value) %>%
+  mutate(variable = as.factor(variable),
+         variable = fct_relevel(variable,name)) %>%
+  group_by(variable,category) %>%
+  mutate(median = median(value), sd=sd(value)) %>%
+  ggplot(aes(x = category,y = value,color=category))+
+  geom_jitter()+
+  geom_errorbar(aes(ymin = median-sd, ymax = median+sd),color = "black")+
+  facet_wrap(.~variable,scales = "free",nrow = 1)+
+ theme_bw()
+```
+
+
+### RS Model
+#### Important Variables
+```{r}
+confirm <- var_imp_m5 %>% pull(variable) %>% as.character()
+top_var_m5 <- as_data_frame(boruta_m5$ImpHistory) %>%
+  select(-c(shadowMax,shadowMean,shadowMin)) %>%
+  select(confirm) %>%
+  gather(everything(), key = variable, value = importance) %>%
+  group_by(variable) %>%
+  summarise(mean = mean(importance),
+            sd = sd(importance),
+            ci_low = quantile(importance,.025),
+            ci_high = quantile(importance,.975)) %>%
+  mutate(variable = fct_reorder(variable, mean)) %>%
+  arrange(desc(mean))
+#Plot top vars
+  ggplot(top_var_m5,aes(x =variable, y=mean,fill = mean))+
+  geom_bar(position="dodge",stat="identity")+
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), alpha=.7)+
+  coord_flip()+
+  ggtitle("RS Model: Important Variables identified by Boruta")+
+ theme_bw()
+```
+
+
+
+#### Top 5 Important Variables plot
+```{r}
+
+##Plot top 5
+name <- top_var_m5 %>%
+  arrange(desc(mean)) %>%
+  head(5) %>%
+  pull(variable) %>%
+  as.character()
+df_m5 %>%
+  select(name,category) %>%
+  mutate(category = recode(category, "X0" = "CP", "X1" = "CI")) %>%
+  gather(1:5, key= variable, value = value) %>%
+  mutate(variable_n = cut_name(variable)) %>%
+  mutate(variable = as.factor(variable),
+         variable = fct_relevel(variable,name)) %>%
+  group_by(variable,category) %>%
+  mutate(median = median(value),
+         sd=sd(value),
+         ci_low = quantile(value,.025),
+        ci_high = quantile(value,.975)) %>%
+  ggplot(aes(x = category,y = value,color=category))+
+  geom_jitter()+
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),color = "black")+
+  facet_wrap(.~variable_n,scales = "free",nrow = 1,
+             labeller =  label_wrap_gen(10,multi_line = TRUE))+
+ theme_bw()
+```
+
+### All Important Variable Model
+#### Important Variables
+```{r}
+confirm <- var_imp_m6 %>% pull(variable) %>% as.character()
+top_var_m6 <- as_data_frame(boruta_m6$ImpHistory) %>%
+  select(-c(shadowMax,shadowMean,shadowMin)) %>%
+  select(confirm) %>%
+  gather(everything(), key = variable, value = importance) %>%
+  group_by(variable) %>%
+  summarise(mean = mean(importance),
+            sd = sd(importance),
+            ci_low = quantile(importance,.025),
+            ci_high = quantile(importance,.975)) %>%
+  mutate(variable = fct_reorder(variable, mean)) %>%
+  arrange(desc(mean))
+#Plot top vars
+  ggplot(top_var_m6,aes(x =variable, y=mean,fill = mean))+
+  geom_bar(position="dodge",stat="identity")+
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), alpha=.7)+
+  coord_flip()+
+  ggtitle("All Important Variables Model: Important Variables identified by Boruta")+
+ theme_bw()
+```
+
+#### Top 5 Important Variables plot
+```{r}
+cut_name_m6 <- function(x){
+  for (i in 1:length(x)){
+    if(nchar(x[i])<=20) {x[i] = x[i]}
+    else if (nchar(x[i])>20){x[i] = cut_name(x[i])}
+  }
+  return(x)
+}
+
+name <- top_var_m6 %>%
+  arrange(desc(mean)) %>%
+  head(5) %>%
+  pull(variable) %>%
+  as.character()
+
+top5_m6_df <- df_m6 %>%
+  select(name,category) %>%
+  mutate(category = recode(category, "X0" = "CP", "X1" = "CI")) %>%
+  gather(1:5, key= variable, value = value)
+
+name_cut <- cut_name_m6(name)
+
+top5_m6_df %>%
+  mutate(variable = cut_name_m6(variable),
+        variable = as.factor(variable),
+         variable = fct_relevel(variable,name_cut)) %>%
+  group_by(variable,category) %>%
+  mutate(median = median(value),
+         sd=sd(value),
+         ci_low = quantile(value,.025),
+        ci_high = quantile(value,.975)) %>%
+  ggplot(aes(x = category,y = value,color=category))+
+  geom_jitter()+
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),color = "black")+
+  facet_wrap(.~variable,scales = "free",nrow = 1)+
+ theme_bw()
+```
+
+### Importance Output
+```{r}
+top_var_m2 <- top_var_m2 %>% mutate(method="T1")
+top_var_m3 <- top_var_m3 %>% mutate(method="T2")
+top_var_m4 <- top_var_m4 %>% mutate(method="DTI")
+top_var_m5 <- top_var_m5 %>% mutate(method="RS")
+top_var_m6 <- top_var_m6 %>% mutate(method="All_Important")
+var_imp_all = rbind(top_var_m2,top_var_m3,top_var_m4,top_var_m5,top_var_m6) %>%
+  select(method, everything()) %>%
+  mutate(method = fct_relevel(method, "T1", "T2", "DTI", "RS","All_Important")) %>%
+  arrange(method, desc(mean))
+write.csv(var_imp_all,"important_var_importance.csv")
+```
+
+### t-test
+```{r}
+var_ttest <- filter(var_imp_all, method!="All_Important") %>% select(variable,method)
+ttest <- df_no128%>% select(as.character(pull(var_ttest,variable)),category)
+result <- lapply(ttest[,-length(ttest)],function(x){
+  return(t.test(x,ttest$category)$p.value)
+}) %>%
+  unlist() %>%
+  as.tibble() %>%
+  mutate(variable = var_ttest$variable) %>%
+  inner_join(var_ttest) %>%
+  rename(p_value = value) %>%
+  select(method, variable, p_value)
+write.csv(result,"important_var_pvalue.csv")
+```
+
+### mtry output
+```{r}
+mtry_all <- rbind(mtry_m1,mtry_m2,mtry_m3,mtry_m4,mtry_m5,mtry_m6)
+write.csv(mtry_all,"mtry_all.csv")
+```

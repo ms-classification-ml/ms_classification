@@ -1,0 +1,240 @@
+---
+title: "MS_Datacreation_v2_20191101"
+author: "Dana Zeng"
+date: "November 1, 2019"
+output: 
+  html_document:
+    toc: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(mice)
+library(table1)
+library(readxl)
+library(nnet)
+library(knitr)
+library(DT)
+```
+
+## Data Manipulation
+
+### Load and Manipulate Data
+ * releveled the category variable
+ * filled the missing for depresison-sleep variable of healthy control with zero
+```{r}
+df <- readxl::read_xlsx ("./ML_all_11.05.xlsx", sheet = 1, col_names = TRUE, na = c("Nan","NaN"))
+## Relevel the outcome and gender variable
+df <- df %>% 
+  janitor::clean_names() %>% 
+  mutate(category = recode(x281, 
+                                    `0` = "Cognitively Preserved" , 
+                                    `1` = "Cognitively Impaired", 
+                                     `2` = "Healthy Control"),
+         sex = recode(sex, `1` = "Male", `2` = "Female")) %>% 
+  mutate(edu_lev = as.factor(edu_lev),
+         edss = as.factor(edss)) %>% 
+  filter(category!="Healthy Control")
+
+
+## Adding Zero to healthy control demographics
+healthy <- which(is.na(df$depression)==T)
+df$depression[healthy] <- rep(0,31)
+df$anxiety[healthy] <- rep(0,31)
+df$fatigue[healthy] <- rep(0,31)
+df$edss[healthy] <- rep(0,31)
+df$sleep[healthy] <- rep(0,31)
+
+### create a new df filtering out 128 who has no correlation matrix
+df_no128 <- df %>% filter(patient != 128)
+```
+
+### Resting State Screening
+ * create another df without patient 128 who doesn't have correlation matrix
+ * lower and diagonal filled with NA
+ * The screening criteria is when both groups' coefficient is significant (1513 selected)
+```{r,eval=F}
+### Load MNI coordinate column names
+change_sign <- function(x){
+for (i in 1:length(x)){
+  if (substr(x[i],1,1)=="-"){
+    x[i] = str_replace (x[i], "-","N")
+  }
+  else if(substr(x[i],1,1)!="-") {
+    x[i]=paste0("P",x[i])
+  }}
+  return(x)}
+column_names <- read_excel("./Power_MNI_coordinates_names.xlsx") %>% 
+  janitor::clean_names() %>%
+  mutate_at(c("mni_coordiantes","x2","x3"),as.character) %>% 
+  mutate_at(c("mni_coordiantes","x2","x3"),change_sign)
+corr_col_names <- apply(column_names, 1, paste, collapse = ",")
+corr_col_names <- gsub("'","",corr_col_names)
+corr_col_names <- trimws(corr_col_names)
+
+
+### Function for Corr for each Z matrix
+corr_predictors <- function(path) {
+  
+corr <- read_delim(path, delim = " ", col_names = FALSE)
+corr <- data.frame(corr)
+colnames(corr) <- corr_col_names
+rownames(corr) <- corr_col_names
+
+
+corr[lower.tri(corr,diag=TRUE)]=NA
+corr <- reshape2::melt(cbind(
+  V1=rownames(corr), 
+  as.data.frame(corr))
+)
+corr <- corr %>% drop_na(value)
+colnames(corr) <- c("col", "row", "corr")
+rownames(corr) <- NULL
+
+
+
+corr <- corr %>% 
+  mutate(MNI_Coordinates = paste0(col, "_", row)) %>% 
+  select(MNI_Coordinates, corr)
+
+MNI_Coordinates <- corr$MNI_Coordinates
+rownames(corr) <- corr$MNI_Coordinates
+corr <- corr %>% select(corr)
+corr <- data.frame(t(corr))
+colnames(corr) <- MNI_Coordinates
+
+return(corr)
+}
+
+## Apply the function to 213 z matrices
+files <- sapply(df_no128$patient, function(x) paste("./Z_matrices/", x, ".txt", sep = ""))
+corr_mat <- do.call(rbind,lapply(files,corr_predictors))
+
+# save(corr_mat,file="corr_mat_healthy.RData")
+# load("./corr_mat_healthy.RData")
+
+MS_Data<- corr_mat %>% 
+  mutate(patient = df_no128$patient,
+         category = df_no128$category) %>% 
+  select(patient, everything()) %>% 
+  remove_rownames() %>% 
+    mutate(category = recode(category, "Cognitively Preserved" = 0, "Cognitively Impaired"  = 1))
+
+rownames(MS_Data) <- NULL
+
+vec <- data.frame(ind = NA, est =NA, pval = NA)
+for (i in 2:34717){
+sum_tb <- broom::tidy(glm(MS_Data[,34718] ~ (MS_Data)[,i], family = "binomial"))
+vec_n <- unlist(c(ind = i, est = sum_tb[2,2], pval = sum_tb[2,5]))
+vec <- rbind(vec,vec_n)
+print(c(i, "done"))
+}
+
+vec_sig <- vec %>% filter(pval<0.05) %>% pull(ind)
+
+rs_data <- MS_Data[,c(vec_sig,1,34718)]
+
+# save(rs_data, vec_sig,MS_Data,file="rs_data.RData")
+# load("./rs_data.RData")
+```
+
+### Merging Resting State Data with Demo+fMRI Data
+* df_join (183*1795)
+```{r,eval=F}
+df <- df %>%  
+  mutate(category = recode(category, "Cognitively Preserved" = 0, "Cognitively Impaired"  = 1))
+df_no128 <- df_no128 %>% 
+   mutate(category = recode(category, "Cognitively Preserved" = 0, "Cognitively Impaired"  = 1))
+df_join <- left_join(df,rs_data) %>% janitor::clean_names()
+df_join_no128 <- left_join(df_no128,rs_data) %>% janitor::clean_names()
+# save(df_join, df_join_no128, file = "MS_Datacreation_v2_ori.Rdata")
+```
+
+
+### Missing Data Pattern
+```{r}
+na_count <- sapply(df, function(y) sum(length(which(is.na(y)))))
+knitr::kable(na_count[na_count!=0], 
+             col.names = "NA_counts",
+             caption = "Variables that contain NAs")
+no_na <- df %>% 
+  select(-c(2:10)) %>% 
+  drop_na() %>% pull(patient)
+
+filter(df, patient %in% (no_na)==F) %>%
+  select(patient,left_i_iv: right_x, mean_fa:rh_unc_md) %>% 
+  knitr::kable(caption = "Patients (Other than Healthy Control) that contain NAs")
+```
+
+### Missing data imputation
+ *  The missing data is imputated by using multiple imputation of cart with 10 iterations
+ 
+```{r, message=F, eval=F}
+# load("./MS_Datacreation_v2_ori.Rdata")
+imp_result <- mice(df_join_no128[,c(172:279)],m=1,meth='cart',seed=500,remove.collinear = FALSE)
+imp <- complete(imp_result)
+df_imputed_no128 <- df_join_no128
+df_imputed_no128[,c(172:279)] <- imp
+
+## save the imputed df(both w/ or w/o 128)
+df_imputed <- rbind(df_imputed_no128,df_join[127,])
+# save(df_imputed,df_imputed_no128 ,file = "MS_Datacreation_v2_imp.Rdata")
+```
+
+#### load original/impuated datasets
+```{r}
+load("./MS_Datacreation_v2_ori.Rdata")
+load("./MS_Datacreation_v2_imp.Rdata")
+```
+
+
+#### Missing data after imputation 
+```{r}
+df_imputed_no128 %>%
+  filter(patient %in% c(3,29,95,114, 148, 152, 154, 169)) %>%
+  select(patient, left_i_iv: right_x, mean_fa:rh_unc_md) %>%
+  knitr::kable(caption = "Patients (Other than Healthy Control) that contain NAs after imputation")
+```
+
+
+
+## Descriptive statistics
+
+### Demographics Descriptive Statistics
+```{r}
+df<- df_imputed %>% 
+  mutate (category = recode(category,  `0` = "Cognitively Preserved" , `1` = "Cognitively Impaired"))
+table1(~sex + age + edu_lev+ iq+ depression + anxiety + fatigue+ edss+ sleep| category, data=df, overall="Total")
+```
+
+### T1 Variables Descriptive Statistics
+```{r}
+t1_sum <- t(apply(df_imputed[,c(11:199)],2, summary))
+datatable(t1_sum)
+```
+
+### T2 Variables Descriptive Statistics
+```{r}
+t2_sum <- t(apply(df_imputed[,c(200:241)],2, summary))
+datatable(t2_sum)
+```
+
+### DTI Variables Descriptive Statistics
+```{r}
+t3_sum <- t(apply(df_imputed[,c(242:279)],2, summary))
+datatable(t3_sum)
+```
+
+
+### RS Variables Descriptive Statistics
+* Most of the minimum/maximum exceed the -1<RS<1 range, but not for the median.
+```{r}
+rs_sum <-  t(apply(df_imputed[,c(283:1795)],2, summary))
+datatable(rs_sum)
+```
+
+
+
+
